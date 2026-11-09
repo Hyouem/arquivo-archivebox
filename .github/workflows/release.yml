@@ -1,0 +1,601 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [dev, main]
+  workflow_dispatch:
+    inputs:
+      release_branch:
+        description: Branch being promoted
+        required: true
+        type: choice
+        options: [main, dev]
+      release_sha:
+        description: Exact tested commit to release
+        required: true
+        type: string
+      ci_run_id:
+        description: Successful CI run containing the tested Python artifacts
+        required: true
+        type: string
+      docker_digest_run_id:
+        description: Manual Docker digest build run containing the tested image digests
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.repository }}-${{ github.event_name == 'workflow_dispatch' && inputs.release_branch || github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+env:
+  DOCKERHUB_IMAGE: archivebox/archivebox
+  GHCR_IMAGE: ghcr.io/archivebox/archivebox
+  RELEASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.release_branch || github.event.workflow_run.head_branch }}
+  RELEASE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.release_sha || github.event.workflow_run.head_sha }}
+
+jobs:
+  candidate:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      (github.event.workflow_run.head_branch == 'dev' || github.event.workflow_run.head_branch == 'main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_branch == 'main')
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      ready: ${{ steps.verified.outputs.ready }}
+      artifact_run_id: ${{ steps.verified.outputs.artifact_run_id }}
+      digest_run_id: ${{ steps.verified.outputs.digest_run_id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_SHA }}
+      - id: owner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          BRANCH_SHA="$(git ls-remote origin "refs/heads/$RELEASE_BRANCH" | cut -f1)"
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch && "$BRANCH_SHA" != "$RELEASE_SHA" ]]; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          VERSION="$(sed -nE 's/^version = "([^"]+)".*/\1/p' pyproject.toml | head -n 1)"
+          if [[ "$RELEASE_BRANCH" == main ]]; then
+            [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "Refusing to publish non-stable version $VERSION as a main release" >&2
+              exit 1
+            }
+            git fetch --no-tags origin main
+            git merge-base --is-ancestor "$RELEASE_SHA" origin/main || {
+              echo "Refusing to publish $RELEASE_SHA: it is not on main" >&2
+              exit 1
+            }
+            TAG_TARGET="$(git ls-remote origin "refs/tags/v$VERSION" | cut -f1)"
+            if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch && -n "$TAG_TARGET" && "$TAG_TARGET" != "$RELEASE_SHA" ]]; then
+              echo 'ready=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A stable release fast-forwards dev to main. Only main publishes it;
+          # the resulting dev workflow is not a new release candidate.
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+rc[0-9]+$ ]]; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TARGET="$(git ls-remote origin "refs/tags/release-candidate/$VERSION" | awk '{print $1}')"
+          [[ "$TARGET" == "$RELEASE_SHA" ]] && echo 'ready=true' >> "$GITHUB_OUTPUT" || echo 'ready=false' >> "$GITHUB_OUTPUT"
+
+      - name: Require successful full CI for this commit
+        id: verified
+        if: steps.owner.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_CI_RUN_ID: ${{ inputs.ci_run_id }}
+          MANUAL_DIGEST_RUN_ID: ${{ inputs.docker_digest_run_id }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            CI_RUN_ID="$MANUAL_CI_RUN_ID"
+            DIGEST_RUN_ID="$MANUAL_DIGEST_RUN_ID"
+            CI_STATUS="$(gh run view "$CI_RUN_ID" --repo "$GITHUB_REPOSITORY" --json status,conclusion,headSha,event,name \
+              --jq '[.status, .conclusion, .headSha, .event, .name] | @tsv')"
+            [[ "$CI_STATUS" == "$(printf 'completed\tsuccess\t%s\tpush\tCI' "$RELEASE_SHA")" ]]
+          else
+            CI_RUN_ID="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+              --commit "$RELEASE_SHA" --branch "$RELEASE_BRANCH" --event push --limit 1 \
+              --json databaseId,status,conclusion \
+              --jq '.[0] | select(.status == "completed" and .conclusion == "success") | .databaseId // empty')"
+            [[ -n "$CI_RUN_ID" ]] || exit 0
+            DIGEST_RUN_ID="$CI_RUN_ID"
+          fi
+          ARTIFACT_RUN_ID="$CI_RUN_ID"
+          {
+            echo 'ready=true'
+            echo "artifact_run_id=$ARTIFACT_RUN_ID"
+            echo "digest_run_id=$DIGEST_RUN_ID"
+          } >> "$GITHUB_OUTPUT"
+
+  python-release:
+    name: Publish tested Python artifacts
+    needs: candidate
+    if: needs.candidate.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      CI_RUN_ID: ${{ needs.candidate.outputs.artifact_run_id }}
+      DOCKER_DIGEST_RUN_ID: ${{ needs.candidate.outputs.digest_run_id }}
+    environment: pypi
+    permissions:
+      actions: read
+      contents: write
+      deployments: read
+      id-token: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      release_ready: ${{ steps.release-state.outputs.ready }}
+    steps:
+      - name: Checkout the tested commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          submodules: true
+          ref: ${{ env.RELEASE_SHA }}
+          token: ${{ secrets.RELEASE_GH_TOKEN || github.token }}
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.13.5"
+          enable-cache: false
+
+      # This precedes every stable upload, including workflow_dispatch. A green
+      # build is not evidence that our automatically updated test servers ran it.
+      # Named lookups avoid the wildcard downloader's 100-artifact listing limit.
+      - name: Download tested Docker base-image metadata (amd64)
+        if: env.RELEASE_BRANCH == 'main'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ${{ runner.temp }}/tested-docker-artifacts
+          name: digest-linux-amd64
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.DOCKER_DIGEST_RUN_ID }}
+
+      - name: Download tested Docker base-image metadata (arm64)
+        if: env.RELEASE_BRANCH == 'main'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ${{ runner.temp }}/tested-docker-artifacts
+          name: digest-linux-arm64
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.DOCKER_DIGEST_RUN_ID }}
+
+      - name: Require matching acceptance on Cabbage
+        if: env.RELEASE_BRANCH == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGING_DOCKER_ARTIFACT_DIR: ${{ runner.temp }}/tested-docker-artifacts
+        run: uv run --no-project python bin/verify-staging-release.py
+
+      - name: Resolve release binaries through abxpkg
+        env:
+          ABXPKG_LIB_DIR: ${{ runner.temp }}/abx-lib
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ABXPKG_SPEC="$(uv run --no-cache --no-project python -c 'import tomllib; package = next(item for item in tomllib.load(open("uv.lock", "rb"))["package"] if item["name"] == "abxpkg"); wheel = package["wheels"][0]; print("abxpkg @ {}#{}".format(wheel["url"], wheel["hash"].replace(":", "=")))')"
+          mkdir -p "$ABXPKG_LIB_DIR/env/bin"
+          uv run --no-cache --no-project --with "$ABXPKG_SPEC" abxpkg env --install \
+            --lib="$ABXPKG_LIB_DIR" \
+            --deps-from="$GITHUB_WORKSPACE/.github/configs/ci-tooling.json:release_binaries" >/dev/null
+          for name in uv gh git jq curl; do
+            test -L "$ABXPKG_LIB_DIR/env/bin/$name"
+            test -x "$ABXPKG_LIB_DIR/env/bin/$name"
+          done
+          {
+            echo "UV_BINARY=$ABXPKG_LIB_DIR/env/bin/uv"
+            echo "GH_BINARY=$ABXPKG_LIB_DIR/env/bin/gh"
+            echo "GIT_BINARY=$ABXPKG_LIB_DIR/env/bin/git"
+            echo "JQ_BINARY=$ABXPKG_LIB_DIR/env/bin/jq"
+            echo "CURL_BINARY=$ABXPKG_LIB_DIR/env/bin/curl"
+          } >> "$GITHUB_ENV"
+
+      - name: Download exact tested distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-distributions
+          path: ${{ runner.temp }}/python-distributions
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.CI_RUN_ID }}
+
+      - name: Record release version
+        id: version
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          VERSION="$($UV_BINARY run --no-cache --no-project python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release branch and version
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          VERSION='${{ steps.version.outputs.version }}'
+          case "$RELEASE_BRANCH" in
+            main)
+              [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+                echo "Refusing to publish non-stable version $VERSION from main" >&2
+                exit 1
+              }
+              ;;
+            dev)
+              [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+rc[0-9]+$ ]] || {
+                echo "Refusing to publish ArchiveBox $VERSION from dev; only archivebox:main may publish non-prerelease versions." >&2
+                exit 1
+              }
+              ;;
+            *)
+              echo "Refusing to publish ArchiveBox $VERSION from unsupported branch $RELEASE_BRANCH; only archivebox:dev and archivebox:main may publish." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Publish the exact tested distributions
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GH_TOKEN || github.token }}
+          RELEASE_DISTRIBUTIONS_DIR: ${{ runner.temp }}/python-distributions
+        run: ./bin/release.sh
+
+      - name: Confirm this tested commit owns the release tag
+        id: release-state
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TARGET=""
+          while read -r sha _; do
+            TARGET="$sha"
+          done < <("$GIT_BINARY" ls-remote origin "refs/tags/${{ steps.version.outputs.tag }}")
+          if [[ "$TARGET" == "$RELEASE_SHA" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  docker-release:
+    name: Publish tested multiarch image
+    if: >-
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    needs: [candidate, python-release]
+    runs-on: ubuntu-24.04
+    env:
+      DOCKER_DIGEST_RUN_ID: ${{ needs.candidate.outputs.digest_run_id }}
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout the tested commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_SHA }}
+          token: ${{ secrets.RELEASE_GH_TOKEN || github.token }}
+
+      - name: Reconcile dev to the tested stable release
+        if: env.RELEASE_BRANCH == 'main' && needs.python-release.outputs.release_ready == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git fetch --no-tags origin main dev
+          MAIN_SHA="$(git rev-parse origin/main)"
+          DEV_SHA="$(git rev-parse origin/dev)"
+          if [[ "$MAIN_SHA" != "$RELEASE_SHA" || "$DEV_SHA" == "$RELEASE_SHA" ]]; then
+            exit 0
+          fi
+          push_dev() {
+            if ! git push origin "$1:refs/heads/dev"; then
+              CURRENT_DEV="$(git ls-remote origin refs/heads/dev | cut -f1)"
+              if [[ "$CURRENT_DEV" == "$DEV_SHA" ]]; then
+                echo "Failed to push dev although it still points to $DEV_SHA" >&2
+                exit 1
+              fi
+              echo "Leaving dev at $CURRENT_DEV: it advanced during release reconciliation"
+            fi
+          }
+          if git merge-base --is-ancestor "$DEV_SHA" "$RELEASE_SHA"; then
+            push_dev "$RELEASE_SHA"
+            exit 0
+          else
+            STATUS=$?
+            [[ "$STATUS" -eq 1 ]] || exit "$STATUS"
+          fi
+          BASE_SHA="$(git merge-base "$MAIN_SHA" "$DEV_SHA")"
+          if git diff --quiet "$BASE_SHA" "$DEV_SHA" -- . ':!pyproject.toml' ':!uv.lock' ':!etc/package.json'; then
+            :
+          else
+            STATUS=$?
+            [[ "$STATUS" -eq 1 ]] || exit "$STATUS"
+            echo "Leaving dev at $DEV_SHA: it contains changes beyond release metadata"
+            exit 0
+          fi
+          normalized_metadata() {
+            case "$2" in
+              pyproject.toml)
+                git show "$1:$2" | awk '
+                  /^\[/ {section = $0}
+                  section == "[project]" && /^version = "[^"]+"$/ {print "version = \"__VERSION__\""; next}
+                  section == "[tool.bumpver]" && /^current_version = "[^"]+"$/ {print "current_version = \"__VERSION__\""; next}
+                  {print}
+                ' ;;
+              uv.lock)
+                git show "$1:$2" | awk 'previous == "name = \"archivebox\"" && /^version = / {print "version = \"__VERSION__\""; previous = $0; next} {print; previous = $0}' ;;
+              etc/package.json)
+                git show "$1:$2" | sed -E 's/^(  "version": )"[^"]+"(,?)$/\1"__VERSION__"\2/' ;;
+            esac
+          }
+          for path in pyproject.toml uv.lock etc/package.json; do
+            BASE_METADATA="$(normalized_metadata "$BASE_SHA" "$path")"
+            DEV_METADATA="$(normalized_metadata "$DEV_SHA" "$path")"
+            if [[ "$BASE_METADATA" != "$DEV_METADATA" ]]; then
+              echo "Leaving dev at $DEV_SHA: $path contains changes beyond release version metadata"
+              exit 0
+            fi
+          done
+          # A concurrent release bot may bump only dev's own version metadata.
+          # Keep that commit as a parent while preserving the exact tested stable tree.
+          git switch --detach "$MAIN_SHA"
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            merge -s ours --no-ff -m "Merge tested stable release into dev" "$DEV_SHA"
+          MERGE_SHA="$(git rev-parse HEAD)"
+          push_dev "$MERGE_SHA"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.13.5"
+          enable-cache: false
+
+      - name: Resolve release and Docker binaries through abxpkg
+        env:
+          ABXPKG_LIB_DIR: ${{ runner.temp }}/abx-lib
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ABXPKG_SPEC="$(uv run --no-cache --no-project python -c 'import tomllib; package = next(item for item in tomllib.load(open("uv.lock", "rb"))["package"] if item["name"] == "abxpkg"); wheel = package["wheels"][0]; print("abxpkg @ {}#{}".format(wheel["url"], wheel["hash"].replace(":", "=")))')"
+          mkdir -p "$ABXPKG_LIB_DIR/env/bin"
+          uv run --no-cache --no-project --with "$ABXPKG_SPEC" abxpkg env --install \
+            --lib="$ABXPKG_LIB_DIR" \
+            --deps-from="$GITHUB_WORKSPACE/.github/configs/ci-tooling.json:release_binaries" \
+            --deps-from="$GITHUB_WORKSPACE/.github/configs/ci-tooling.json:docker_binaries" >/dev/null
+          for name in uv gh git jq docker; do
+            test -L "$ABXPKG_LIB_DIR/env/bin/$name"
+            test -x "$ABXPKG_LIB_DIR/env/bin/$name"
+          done
+          {
+            echo "UV_BINARY=$ABXPKG_LIB_DIR/env/bin/uv"
+            echo "GIT_BINARY=$ABXPKG_LIB_DIR/env/bin/git"
+            echo "GH_BINARY=$ABXPKG_LIB_DIR/env/bin/gh"
+            echo "JQ_BINARY=$ABXPKG_LIB_DIR/env/bin/jq"
+            echo "DOCKER_BINARY=$ABXPKG_LIB_DIR/env/bin/docker"
+          } >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          # These images were already built and tested; only publish manifests.
+          driver: docker
+
+      - uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
+        with:
+          username: archivebox
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # Named lookups avoid the wildcard downloader's 100-artifact listing limit.
+      - name: Download exact tested image digests (amd64)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: /tmp/digests
+          name: digest-linux-amd64
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.DOCKER_DIGEST_RUN_ID }}
+
+      - name: Download exact tested image digests (arm64)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: /tmp/digests
+          name: digest-linux-arm64
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.DOCKER_DIGEST_RUN_ID }}
+
+      - name: Verify exact successful digest build run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          RUN_STATUS="$($GH_BINARY run view "$DOCKER_DIGEST_RUN_ID" --repo "$GITHUB_REPOSITORY" --json status --jq '.status')"
+          RUN_CONCLUSION="$($GH_BINARY run view "$DOCKER_DIGEST_RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion --jq '.conclusion')"
+          [[ "$RUN_STATUS" == completed && "$RUN_CONCLUSION" == success ]]
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch ]]; then
+            RUN_SHA="$($GH_BINARY run view "$DOCKER_DIGEST_RUN_ID" --repo "$GITHUB_REPOSITORY" --json headSha --jq '.headSha')"
+            [[ "$RUN_SHA" == "$RELEASE_SHA" ]]
+          fi
+
+      - name: Verify digest set and collect tags
+        id: docker_meta
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mapfile -t DIGESTS < <($UV_BINARY run --no-cache --no-project python -c 'import re; from pathlib import Path; print("\n".join(sorted(path.name for path in Path("/tmp/digests").iterdir() if path.is_file() and re.fullmatch(r"[0-9a-f]{64}", path.name))))')
+          [[ "${#DIGESTS[@]}" -eq 2 ]]
+          for digest in "${DIGESTS[@]}"; do [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; done
+          [[ "$(< /tmp/digests/source-ref)" == "$RELEASE_SHA" ]]
+
+          VERSION='${{ needs.python-release.outputs.version }}'
+          SHORT_SHA="${RELEASE_SHA::12}"
+          TAG_TARGET="$($GIT_BINARY ls-remote origin "refs/tags/v${VERSION}^{}")"
+          TAG_TARGET="${TAG_TARGET%%[[:space:]]*}"
+          if [[ -z "$TAG_TARGET" ]]; then
+            TAG_TARGET="$($GIT_BINARY ls-remote origin "refs/tags/v${VERSION}")"
+            TAG_TARGET="${TAG_TARGET%%[[:space:]]*}"
+          fi
+          if [[ "$RELEASE_BRANCH" == main ]]; then
+            [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "Refusing to tag :latest with prerelease $VERSION" >&2
+              exit 1
+            }
+            [[ "$TAG_TARGET" == "$RELEASE_SHA" ]] || {
+              echo "Refusing to tag :latest: v$VERSION does not point to $RELEASE_SHA" >&2
+              exit 1
+            }
+            $GIT_BINARY fetch --no-tags origin main
+            $GIT_BINARY merge-base --is-ancestor "$RELEASE_SHA" origin/main || {
+              echo "Refusing to tag :latest: $RELEASE_SHA is not on main" >&2
+              exit 1
+            }
+            MAIN_VERSION="$($GIT_BINARY show origin/main:pyproject.toml | sed -nE 's/^version = "([^"]+)".*/\1/p' | head -n 1)"
+            [[ "$MAIN_VERSION" == "$VERSION" ]] || {
+              echo "Refusing to tag :latest: main is now $MAIN_VERSION, not $VERSION" >&2
+              exit 1
+            }
+          fi
+          SYNC_DEV=false
+          if [[ "$RELEASE_BRANCH" == main ]]; then
+            $GIT_BINARY fetch --no-tags origin main dev
+            MAIN_TARGET="$($GIT_BINARY rev-parse origin/main)"
+            DEV_TARGET="$($GIT_BINARY rev-parse origin/dev)"
+            # Recovery can add CI/docs fixes after the immutable release tag.
+            # Both branches and every shipped application file must agree.
+            if $GIT_BINARY merge-base --is-ancestor "$MAIN_TARGET" "$DEV_TARGET" &&
+               $GIT_BINARY diff --quiet "$MAIN_TARGET" "$DEV_TARGET" &&
+               $GIT_BINARY diff --quiet "$RELEASE_SHA" "$MAIN_TARGET" -- . ':!.github' ':!README.md'; then
+              SYNC_DEV=true
+            fi
+          fi
+          {
+            echo 'dockerhub_tags<<EOF'
+            if [[ "$RELEASE_BRANCH" == dev ]]; then
+              echo "${DOCKERHUB_IMAGE}:dev"
+            elif [[ "$RELEASE_BRANCH" == main ]]; then
+              echo "${DOCKERHUB_IMAGE}:latest"
+              [[ "$SYNC_DEV" == true ]] && echo "${DOCKERHUB_IMAGE}:dev"
+            fi
+            echo "${DOCKERHUB_IMAGE}:sha-${SHORT_SHA}"
+            [[ "$TAG_TARGET" == "$RELEASE_SHA" ]] && echo "${DOCKERHUB_IMAGE}:${VERSION}"
+            echo 'EOF'
+            echo 'ghcr_tags<<EOF'
+            if [[ "$RELEASE_BRANCH" == dev ]]; then
+              echo "${GHCR_IMAGE}:dev"
+            elif [[ "$RELEASE_BRANCH" == main ]]; then
+              echo "${GHCR_IMAGE}:latest"
+              [[ "$SYNC_DEV" == true ]] && echo "${GHCR_IMAGE}:dev"
+            fi
+            echo "${GHCR_IMAGE}:sha-${SHORT_SHA}"
+            [[ "$TAG_TARGET" == "$RELEASE_SHA" ]] && echo "${GHCR_IMAGE}:${VERSION}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Promote the exact tested universal image
+        env:
+          DOCKERHUB_TAGS: ${{ steps.docker_meta.outputs.dockerhub_tags }}
+          GHCR_TAGS: ${{ steps.docker_meta.outputs.ghcr_tags }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mapfile -t DIGESTS < <(find /tmp/digests -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort | grep -E '^[0-9a-f]{64}$')
+          REFS=()
+          for digest in "${DIGESTS[@]}"; do REFS+=("${DOCKERHUB_IMAGE}@sha256:${digest}"); done
+          EXPECTED="$("$DOCKER_BINARY" buildx imagetools create --dry-run "${REFS[@]}" | "$JQ_BINARY" -ceS '.manifests | sort_by(.digest)')"
+          "$JQ_BINARY" -e 'map(select(.platform.os == "linux") | .platform.architecture) | sort == ["amd64", "arm64"]' <<< "$EXPECTED"
+          for registry in DOCKERHUB GHCR; do
+            image_var="${registry}_IMAGE"
+            tags_var="${registry}_TAGS"
+            REFS=()
+            if [[ "$RELEASE_BRANCH" == dev ]]; then
+              # Retag this green run's image, never a newer moving unstable tag.
+              REFS=("${!image_var}:sha-${RELEASE_SHA::12}")
+              ACTUAL="$("$DOCKER_BINARY" buildx imagetools inspect --raw "${REFS[0]}" | "$JQ_BINARY" -ceS '.manifests | sort_by(.digest)')"
+              [[ "$ACTUAL" == "$EXPECTED" ]]
+            else
+              for digest in "${DIGESTS[@]}"; do REFS+=("${!image_var}@sha256:${digest}"); done
+            fi
+            TAG_ARGS=()
+            while IFS= read -r tag; do [[ -n "$tag" ]] && TAG_ARGS+=(--tag "$tag"); done <<< "${!tags_var}"
+            "$DOCKER_BINARY" buildx imagetools create "${TAG_ARGS[@]}" "${REFS[@]}"
+            while IFS= read -r tag; do
+              [[ -n "$tag" ]] || continue
+              ACTUAL="$("$DOCKER_BINARY" buildx imagetools inspect --raw "$tag" | "$JQ_BINARY" -ceS '.manifests | sort_by(.digest)')"
+              [[ "$ACTUAL" == "$EXPECTED" ]]
+              echo "Verified exact tested images: $tag"
+            done <<< "${!tags_var}"
+          done
+
+      - name: Record published image source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # workflow_run can report the default branch's head even when this
+          # run published a different branch/SHA. Preserve the verified target.
+          [[ "$RELEASE_BRANCH" == dev || "$RELEASE_BRANCH" == main ]]
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          mkdir -p "$RUNNER_TEMP/published-image-source"
+          # shellcheck disable=SC2016
+          "$JQ_BINARY" -n --arg branch "$RELEASE_BRANCH" --arg sha "$RELEASE_SHA" \
+            '{branch: $branch, sha: $sha}' > "$RUNNER_TEMP/published-image-source/source.json"
+
+      - name: Upload published image source
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: published-image-source
+          path: ${{ runner.temp }}/published-image-source/source.json
+          if-no-files-found: error
+
+
+  cascade:
+    name: Cascade verified release
+    if: needs.python-release.outputs.release_ready == 'true'
+    needs:
+      - candidate
+      - python-release
+      - docker-release
+    permissions:
+      actions: read
+      contents: read
+    uses: ArchiveBox/monorepo/.github/workflows/cascade-release.yml@main
+    with:
+      upstream_package: archivebox
+      upstream_version: ${{ needs.python-release.outputs.version }}
+      upstream_artifact_name: python-distributions
+      upstream_run_id: ${{ needs.candidate.outputs.artifact_run_id }}
+    secrets:
+      release_token: ${{ secrets.RELEASE_GH_TOKEN }}

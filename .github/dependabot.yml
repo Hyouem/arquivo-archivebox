@@ -1,0 +1,38 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    target-branch: "dev"
+    schedule:
+      interval: "monthly"
+    # Match tool.uv.exclude-newer so the bot only requests age-eligible releases.
+    cooldown:
+      default-days: 5
+    ignore:
+      # Mirror the fixed tool.uv.exclude-newer-package cutoffs. Update these
+      # bounds together with the corresponding cutoff after reviewing a release.
+      - dependency-name: "twisted"
+        versions: [">26.10.0rc1"]
+      - dependency-name: "uv"
+        versions: [">0.13.5"]
+      # abx-dl excludes this release; retain updates to later compatible versions.
+      - dependency-name: "psutil"
+        versions: ["7.2.2"]
+    groups:
+      pip:
+        patterns:
+          - "*"
+  - package-ecosystem: "npm"
+    directory: "/etc"
+    target-branch: "dev"
+    schedule:
+      interval: "monthly"
+    groups:
+      npm:
+        patterns:
+          - "*"
